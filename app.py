@@ -416,19 +416,54 @@ elif page == "Tests de Robustesse":
                     with cols[i]:
                         st.image(img, caption=name, use_container_width=True)
 
+            # Compute metrics
             st.markdown("---")
-            st.subheader("Analyse de l'impact")
+            st.subheader("Metriques de distorsion")
+
+            orig_arr = np.array(original_rgb).astype(np.float64) / 255.0
+            rows_metrics = []
+            for name, img in transforms.items():
+                if name == "Original":
+                    continue
+                t_arr = np.array(img.resize(original_rgb.size)).astype(np.float64) / 255.0
+                mse = np.mean((orig_arr - t_arr) ** 2)
+                psnr = 10 * np.log10(1.0 / mse) if mse > 0 else float("inf")
+                # Correlation on flattened grayscale
+                gray_o = np.mean(orig_arr, axis=2).flatten()
+                gray_t = np.mean(t_arr, axis=2).flatten()
+                corr = np.corrcoef(gray_o, gray_t)[0, 1]
+                # Color distance (mean absolute diff per channel)
+                color_diff = np.mean(np.abs(orig_arr - t_arr)) * 255
+                rows_metrics.append({
+                    "Transformation": name,
+                    "MSE": round(mse, 5),
+                    "PSNR (dB)": round(psnr, 1),
+                    "Correlation": round(corr, 4),
+                    "Ecart couleur moyen": round(color_diff, 1),
+                    "Impact": "Fort" if corr < 0.85 else ("Moyen" if corr < 0.95 else "Faible"),
+                })
+
+            df_metrics = pd.DataFrame(rows_metrics)
+            st.dataframe(df_metrics, use_container_width=True, hide_index=True)
+
             st.markdown("""
-| Transformation | Impact attendu | Strategie |
-|---------------|----------------|-----------|
-| **Crop partiel** | Fort - perte de forme globale | Data augmentation avec crops |
-| **Rotation** | Moyen - MobileNetV2 partiellement invariant | Augmentation rotations |
-| **Miroir** | Faible - symetrie preservee | Flip horizontal standard |
-| **Flou** | Moyen - perte de texture | Simule photos floues reelles |
-| **Sombre** | Moyen - perte de contraste | Normalisation + augmentation |
-| **Desature** | Fort - couleur discriminante | Travailler aussi sur la forme |
-| **Bruit** | Faible a moyen | Denoising en preprocessing |
+**Legende :**
+- **MSE** : erreur quadratique moyenne (0 = identique)
+- **PSNR** : ratio signal/bruit en dB (plus haut = plus proche de l'original)
+- **Correlation** : similarite structurelle (1.0 = identique)
+- **Ecart couleur** : difference moyenne par pixel (0-255)
+- **Impact** : Fort (corr < 0.85), Moyen (< 0.95), Faible (>= 0.95)
             """)
+
+            # Bar chart
+            fig = px.bar(
+                df_metrics, x="Transformation", y="Correlation",
+                title="Correlation avec l'image originale par transformation",
+                color="Impact",
+                color_discrete_map={"Faible": "#2ecc71", "Moyen": "#f39c12", "Fort": "#e74c3c"}
+            )
+            fig.update_layout(xaxis_tickangle=-45, yaxis_range=[0, 1.05])
+            st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
         st.subheader("Test avec une image externe")
