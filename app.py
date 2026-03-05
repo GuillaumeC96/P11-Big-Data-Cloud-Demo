@@ -529,11 +529,31 @@ elif page == "Identifier un fruit":
     les features PCA stockees sur S3.
     """)
 
-    uploaded = st.file_uploader("Prenez en photo un fruit ou uploadez une image",
-                                type=["jpg", "png", "jpeg"], key="identify_upload")
+    # Load a default image from S3 or let user upload
+    use_default = st.checkbox("Utiliser une image du dataset S3", value=True)
 
-    if uploaded:
-        user_img = Image.open(uploaded).convert("RGB")
+    user_img = None
+    if use_default:
+        categories = get_s3_categories()
+        if categories:
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                default_cat = st.selectbox("Categorie", categories, key="id_cat")
+            with col_d2:
+                objects = list_s3_objects(f"{S3_INPUT}{default_cat}/", max_keys=20)
+                img_keys = [o["Key"] for o in objects if o["Key"].lower().endswith((".jpg", ".png", ".jpeg"))]
+                default_idx = st.slider("Image #", 0, max(0, len(img_keys)-1), 0, key="id_idx")
+            if img_keys:
+                user_img = get_s3_image(img_keys[default_idx]).convert("RGB")
+        else:
+            st.warning("Aucune image sur S3.")
+    else:
+        uploaded = st.file_uploader("Prenez en photo un fruit ou uploadez une image",
+                                    type=["jpg", "png", "jpeg"], key="identify_upload")
+        if uploaded:
+            user_img = Image.open(uploaded).convert("RGB")
+
+    if user_img:
 
         col1, col2 = st.columns([1, 2])
         with col1:
