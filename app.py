@@ -93,7 +93,7 @@ def load_pca_from_s3():
     if not parquet_keys:
         return None
     dfs = []
-    for key in parquet_keys[:5]:
+    for key in parquet_keys:
         resp = s3.get_object(Bucket=BUCKET, Key=key)
         buf = BytesIO(resp["Body"].read())
         df = pq.read_table(buf).to_pandas()
