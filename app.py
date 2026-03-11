@@ -13,7 +13,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
 from PIL import Image, ImageFilter, ImageEnhance
+from scipy.spatial.distance import cdist
+from collections import Counter
+import pickle
 import time
+import torch
+import torchvision.models as models
+import torchvision.transforms as transforms
 
 # --- Config ---
 BUCKET = "fruits-bigdata-p11"
@@ -93,6 +99,38 @@ def load_pca_from_s3():
         df = pq.read_table(buf).to_pandas()
         dfs.append(df)
     return pd.concat(dfs, ignore_index=True)
+
+
+@st.cache_resource
+def get_feature_extractor():
+    model = models.mobilenet_v2(weights='IMAGENET1K_V1')
+    feature_extractor = torch.nn.Sequential(
+        model.features,
+        torch.nn.AdaptiveAvgPool2d((1, 1)),
+        torch.nn.Flatten()
+    )
+    feature_extractor.eval()
+    return feature_extractor
+
+
+@st.cache_resource
+def get_pca_model():
+    s3 = get_s3_client()
+    resp = s3.get_object(Bucket=BUCKET, Key='output/pca_model.pkl')
+    return pickle.loads(resp['Body'].read())
+
+
+def extract_features(img):
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    tensor = preprocess(img).unsqueeze(0)
+    extractor = get_feature_extractor()
+    with torch.no_grad():
+        features = extractor(tensor).numpy().flatten()
+    return features
 
 
 def get_bucket_info():
@@ -524,9 +562,8 @@ elif page == "Resultats PCA (S3)":
 elif page == "Identifier un fruit":
     st.title("Identification d'un fruit")
     st.markdown("""
-    **Cas d'usage metier** : l'utilisateur de l'app mobile photographie un fruit
-    et obtient des informations. Cette page simule ce parcours en utilisant
-    les features PCA stockees sur S3.
+    **Pipeline identique au notebook** : MobileNetV2 (1280 features) → PCA (100 dims) → 5-NN cosinus.
+    Les references PCA sont chargees depuis S3.
     """)
 
     # Load a default image from S3 or let user upload
@@ -560,80 +597,72 @@ elif page == "Identifier un fruit":
             st.image(user_img, caption="Votre image", use_container_width=True)
 
         with col2:
-            st.markdown("**Etapes du pipeline d'identification :**")
-            steps = st.empty()
+            st.markdown("**Pipeline d'identification (identique au notebook) :**")
 
-            with st.spinner("1/4 - Preprocessing (resize 224x224, normalisation)..."):
-                resized = user_img.resize((224, 224))
-                arr = np.array(resized).astype(np.float32) / 255.0
-                time.sleep(0.3)
-            st.success("1/4 - Preprocessing OK")
+            with st.spinner("1/4 - Extraction features MobileNetV2 (1280 dims)..."):
+                user_features_1280 = extract_features(user_img)
+            st.success(f"1/4 - Features extraites ({len(user_features_1280)} dims)")
 
-            with st.spinner("2/4 - Extraction features MobileNetV2 (1280 dims)..."):
-                # Simulate feature extraction with color/texture histograms
-                # (MobileNetV2 not available on Streamlit Cloud)
-                r_hist = np.histogram(arr[:,:,0], bins=50, range=(0,1))[0].astype(float)
-                g_hist = np.histogram(arr[:,:,1], bins=50, range=(0,1))[0].astype(float)
-                b_hist = np.histogram(arr[:,:,2], bins=50, range=(0,1))[0].astype(float)
-                user_features = np.concatenate([r_hist, g_hist, b_hist])
-                user_features = user_features / (user_features.sum() + 1e-8)
-                time.sleep(0.5)
-            st.success("2/4 - Features extraites (1280 dims)")
+            with st.spinner("2/4 - Projection PCA (100 dims)..."):
+                pca_model = get_pca_model()
+                user_pca = pca_model.transform(user_features_1280.reshape(1, -1)).flatten()
+            st.success("2/4 - PCA appliquee (100 dims)")
 
             with st.spinner("3/4 - Chargement des references PCA depuis S3..."):
                 df = load_pca_from_s3()
-                time.sleep(0.3)
             st.success(f"3/4 - {len(df):,} references chargees depuis S3")
 
-            with st.spinner("4/4 - Comparaison et identification..."):
-                # Compare with S3 images by loading sample images and computing color similarity
-                categories = get_s3_categories()
-                scores = {}
-                for cat in categories:
-                    objects = list_s3_objects(f"{S3_INPUT}{cat}/", max_keys=3)
-                    img_keys = [o["Key"] for o in objects if o["Key"].lower().endswith((".jpg", ".png", ".jpeg"))]
-                    cat_scores = []
-                    for key in img_keys[:3]:
-                        try:
-                            ref_img = get_s3_image(key).convert("RGB").resize((224, 224))
-                            ref_arr = np.array(ref_img).astype(np.float32) / 255.0
-                            r_h = np.histogram(ref_arr[:,:,0], bins=50, range=(0,1))[0].astype(float)
-                            g_h = np.histogram(ref_arr[:,:,1], bins=50, range=(0,1))[0].astype(float)
-                            b_h = np.histogram(ref_arr[:,:,2], bins=50, range=(0,1))[0].astype(float)
-                            ref_features = np.concatenate([r_h, g_h, b_h])
-                            ref_features = ref_features / (ref_features.sum() + 1e-8)
-                            similarity = np.dot(user_features, ref_features) / (
-                                np.linalg.norm(user_features) * np.linalg.norm(ref_features) + 1e-8)
-                            cat_scores.append(similarity)
-                        except:
-                            pass
-                    if cat_scores:
-                        scores[cat] = max(cat_scores)
-                time.sleep(0.3)
+            with st.spinner("4/4 - Recherche 5-NN (distance cosinus)..."):
+                # Parse PCA features
+                pca_features_list = df["pca_features"].apply(
+                    lambda x: x["values"] if isinstance(x, dict) and "values" in x
+                    else (list(x) if hasattr(x, "__iter__") else x)
+                )
+                pca_data = np.array(pca_features_list.tolist())
+                labels = df["label"].values
+
+                # Filter test-multiple
+                mask = ~pd.Series(labels).str.startswith("test-multiple")
+                pca_data = pca_data[mask.values]
+                labels = labels[mask.values]
+
+                # 5-NN cosine distance
+                distances = cdist(user_pca.reshape(1, -1), pca_data, metric="cosine").flatten()
+                top5_idx = distances.argsort()[:5]
+
+                labels_top5 = [labels[idx] for idx in top5_idx]
+                prediction = Counter(labels_top5).most_common(1)[0][0]
             st.success("4/4 - Identification terminee")
 
         st.markdown("---")
-        if scores:
-            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            best_cat, best_score = sorted_scores[0]
+        st.subheader(f"Resultat : {prediction}")
+        st.metric("Distance cosinus moyenne (5-NN)", f"{distances[top5_idx].mean():.4f}")
 
-            st.subheader(f"Resultat : {best_cat}")
-            st.metric("Confiance (similarite couleur)", f"{best_score*100:.1f}%")
+        st.markdown("**Top 5 plus proches voisins :**")
+        top5_data = []
+        for i, idx in enumerate(top5_idx):
+            top5_data.append({
+                "Rang": i + 1,
+                "Categorie": labels[idx],
+                "Distance cosinus": round(float(distances[idx]), 4),
+            })
+        st.dataframe(pd.DataFrame(top5_data), use_container_width=True, hide_index=True)
 
-            st.markdown("**Top 5 des categories les plus proches :**")
-            top5 = sorted_scores[:5]
-            fig = px.bar(
-                x=[s[0] for s in top5], y=[s[1]*100 for s in top5],
-                labels={"x": "Categorie", "y": "Similarite (%)"},
-                title="Score de similarite par categorie"
-            )
-            fig.update_layout(yaxis_range=[0, 100])
-            st.plotly_chart(fig, use_container_width=True)
+        # Bar chart of top 5
+        fig = px.bar(
+            x=[d["Categorie"] for d in top5_data],
+            y=[1 - d["Distance cosinus"] for d in top5_data],
+            labels={"x": "Categorie", "y": "Similarite (1 - distance)"},
+            title="Similarite cosinus des 5 plus proches voisins"
+        )
+        fig.update_layout(yaxis_range=[0, 1])
+        st.plotly_chart(fig, use_container_width=True)
 
-            # Show reference images from best match
-            st.markdown(f"**Images de reference ({best_cat}) depuis S3 :**")
-            ref_objects = list_s3_objects(f"{S3_INPUT}{best_cat}/", max_keys=4)
-            ref_keys = [o["Key"] for o in ref_objects if o["Key"].lower().endswith((".jpg", ".png", ".jpeg"))]
+        # Show reference images from best match
+        st.markdown(f"**Images de reference ({prediction}) depuis S3 :**")
+        ref_objects = list_s3_objects(f"{S3_INPUT}{prediction}/", max_keys=4)
+        ref_keys = [o["Key"] for o in ref_objects if o["Key"].lower().endswith((".jpg", ".png", ".jpeg"))]
+        if ref_keys:
             ref_cols = st.columns(min(4, len(ref_keys)))
             for i, key in enumerate(ref_keys[:4]):
                 with ref_cols[i]:
@@ -642,11 +671,8 @@ elif page == "Identifier un fruit":
                     except:
                         pass
 
-            st.info("Note : en production, l'identification utiliserait les features MobileNetV2 "
-                    "projetees par PCA puis un classifieur entraine (Random Forest / CNN). "
-                    "Ici, la similarite est basee sur les histogrammes couleur a titre de demonstration.")
-        else:
-            st.warning("Aucune categorie de reference disponible sur S3.")
+        st.info("Ce pipeline est identique a celui du notebook : MobileNetV2 → PCA (sklearn) → 5-NN cosinus. "
+                "Les resultats sont donc coherents entre le notebook et cette application.")
 
 
 # ============================================================
