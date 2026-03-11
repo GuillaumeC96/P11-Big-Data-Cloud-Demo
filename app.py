@@ -13,19 +13,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
 from PIL import Image, ImageFilter, ImageEnhance
-from scipy.spatial.distance import cdist
-from collections import Counter
-import pickle
+import json
+import base64
 import time
-import torch
-import torchvision.models as models
-import torchvision.transforms as transforms
 
 # --- Config ---
 BUCKET = "fruits-bigdata-p11"
 REGION = "eu-west-3"
 S3_INPUT = "input/images/Training/"
 S3_OUTPUT = "output/pca_parquet/parquet_files/"
+LAMBDA_URL = "https://5jcr4iliqvarfwuw2h6uca52na0htmit.lambda-url.eu-west-3.on.aws/"
 
 st.set_page_config(
     page_title="P11 - Demo AWS Big Data",
@@ -101,36 +98,26 @@ def load_pca_from_s3():
     return pd.concat(dfs, ignore_index=True)
 
 
-@st.cache_resource
-def get_feature_extractor():
-    model = models.mobilenet_v2(weights='IMAGENET1K_V1')
-    feature_extractor = torch.nn.Sequential(
-        model.features,
-        torch.nn.AdaptiveAvgPool2d((1, 1)),
-        torch.nn.Flatten()
+def invoke_lambda(img):
+    """Send image to Lambda for inference (MobileNetV2 + PCA + 5-NN)."""
+    buf = BytesIO()
+    img.save(buf, format="JPEG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    lambda_client = boto3.client(
+        "lambda",
+        region_name=REGION,
+        aws_access_key_id=st.secrets["aws"]["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=st.secrets["aws"]["AWS_SECRET_ACCESS_KEY"],
     )
-    feature_extractor.eval()
-    return feature_extractor
-
-
-@st.cache_resource
-def get_pca_model():
-    s3 = get_s3_client()
-    resp = s3.get_object(Bucket=BUCKET, Key='output/pca_model.pkl')
-    return pickle.loads(resp['Body'].read())
-
-
-def extract_features(img):
-    preprocess = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    tensor = preprocess(img).unsqueeze(0)
-    extractor = get_feature_extractor()
-    with torch.no_grad():
-        features = extractor(tensor).numpy().flatten()
-    return features
+    resp = lambda_client.invoke(
+        FunctionName="p11-fruit-inference",
+        Payload=json.dumps({"image": img_b64}).encode(),
+    )
+    result = json.loads(resp["Payload"].read())
+    if "body" in result:
+        return json.loads(result["body"])
+    return result
 
 
 def get_bucket_info():
@@ -597,82 +584,68 @@ elif page == "Identifier un fruit":
             st.image(user_img, caption="Votre image", use_container_width=True)
 
         with col2:
-            st.markdown("**Pipeline d'identification (identique au notebook) :**")
+            st.markdown("**Pipeline AWS Lambda (inference serverless) :**")
 
-            with st.spinner("1/4 - Extraction features MobileNetV2 (1280 dims)..."):
-                user_features_1280 = extract_features(user_img)
-            st.success(f"1/4 - Features extraites ({len(user_features_1280)} dims)")
+            with st.spinner("Envoi a AWS Lambda → MobileNetV2 → PCA → 5-NN cosinus..."):
+                start = time.time()
+                result = invoke_lambda(user_img)
+                elapsed = time.time() - start
 
-            with st.spinner("2/4 - Projection PCA (100 dims)..."):
-                pca_model = get_pca_model()
-                user_pca = pca_model.transform(user_features_1280.reshape(1, -1)).flatten()
-            st.success("2/4 - PCA appliquee (100 dims)")
+            if "error" in result:
+                st.error(f"Erreur Lambda: {result['error']}")
+            else:
+                st.success(f"Inference terminee en {elapsed:.1f}s")
 
-            with st.spinner("3/4 - Chargement des references PCA depuis S3..."):
-                df = load_pca_from_s3()
-            st.success(f"3/4 - {len(df):,} references chargees depuis S3")
+                prediction = result["prediction"]
+                confidence = result["confidence"]
+                top5 = result["top5"]
 
-            with st.spinner("4/4 - Recherche 5-NN (distance cosinus)..."):
-                # Parse PCA features
-                pca_features_list = df["pca_features"].apply(
-                    lambda x: x["values"] if isinstance(x, dict) and "values" in x
-                    else (list(x) if hasattr(x, "__iter__") else x)
+                st.markdown("---")
+                st.subheader(f"Resultat : {prediction}")
+
+                col_m1, col_m2 = st.columns(2)
+                col_m1.metric("Confiance", f"{confidence*100:.1f}%")
+                col_m2.metric("Latence inference", f"{elapsed:.1f}s")
+
+                st.markdown("**Top 5 plus proches voisins :**")
+                top5_data = []
+                for t in top5:
+                    top5_data.append({
+                        "Rang": t["rank"],
+                        "Categorie": t["label"],
+                        "Distance cosinus": t["distance"],
+                    })
+                st.dataframe(pd.DataFrame(top5_data), use_container_width=True, hide_index=True)
+
+                # Bar chart
+                fig = px.bar(
+                    x=[t["label"] for t in top5],
+                    y=[1 - t["distance"] for t in top5],
+                    labels={"x": "Categorie", "y": "Similarite (1 - distance)"},
+                    title="Similarite cosinus des 5 plus proches voisins"
                 )
-                pca_data = np.array(pca_features_list.tolist())
-                labels = df["label"].values
+                fig.update_layout(yaxis_range=[0, 1])
+                st.plotly_chart(fig, use_container_width=True)
 
-                # Filter test-multiple
-                mask = ~pd.Series(labels).str.startswith("test-multiple")
-                pca_data = pca_data[mask.values]
-                labels = labels[mask.values]
+                # Show reference images from best match
+                st.markdown(f"**Images de reference ({prediction}) depuis S3 :**")
+                ref_objects = list_s3_objects(f"{S3_INPUT}{prediction}/", max_keys=4)
+                ref_keys = [o["Key"] for o in ref_objects if o["Key"].lower().endswith((".jpg", ".png", ".jpeg"))]
+                if ref_keys:
+                    ref_cols = st.columns(min(4, len(ref_keys)))
+                    for i, key in enumerate(ref_keys[:4]):
+                        with ref_cols[i]:
+                            try:
+                                st.image(get_s3_image(key), caption=key.split("/")[-1], use_container_width=True)
+                            except:
+                                pass
 
-                # 5-NN cosine distance
-                distances = cdist(user_pca.reshape(1, -1), pca_data, metric="cosine").flatten()
-                top5_idx = distances.argsort()[:5]
-
-                labels_top5 = [labels[idx] for idx in top5_idx]
-                prediction = Counter(labels_top5).most_common(1)[0][0]
-            st.success("4/4 - Identification terminee")
-
-        st.markdown("---")
-        st.subheader(f"Resultat : {prediction}")
-        st.metric("Distance cosinus moyenne (5-NN)", f"{distances[top5_idx].mean():.4f}")
-
-        st.markdown("**Top 5 plus proches voisins :**")
-        top5_data = []
-        for i, idx in enumerate(top5_idx):
-            top5_data.append({
-                "Rang": i + 1,
-                "Categorie": labels[idx],
-                "Distance cosinus": round(float(distances[idx]), 4),
-            })
-        st.dataframe(pd.DataFrame(top5_data), use_container_width=True, hide_index=True)
-
-        # Bar chart of top 5
-        fig = px.bar(
-            x=[d["Categorie"] for d in top5_data],
-            y=[1 - d["Distance cosinus"] for d in top5_data],
-            labels={"x": "Categorie", "y": "Similarite (1 - distance)"},
-            title="Similarite cosinus des 5 plus proches voisins"
-        )
-        fig.update_layout(yaxis_range=[0, 1])
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Show reference images from best match
-        st.markdown(f"**Images de reference ({prediction}) depuis S3 :**")
-        ref_objects = list_s3_objects(f"{S3_INPUT}{prediction}/", max_keys=4)
-        ref_keys = [o["Key"] for o in ref_objects if o["Key"].lower().endswith((".jpg", ".png", ".jpeg"))]
-        if ref_keys:
-            ref_cols = st.columns(min(4, len(ref_keys)))
-            for i, key in enumerate(ref_keys[:4]):
-                with ref_cols[i]:
-                    try:
-                        st.image(get_s3_image(key), caption=key.split("/")[-1], use_container_width=True)
-                    except:
-                        pass
-
-        st.info("Ce pipeline est identique a celui du notebook : MobileNetV2 → PCA (sklearn) → 5-NN cosinus. "
-                "Les resultats sont donc coherents entre le notebook et cette application.")
+                st.markdown("---")
+                st.info(
+                    "**Architecture** : Streamlit (front-end) → AWS Lambda (inference MobileNetV2 + PCA + 5-NN) "
+                    "→ S3 (stockage features PCA et modele). "
+                    "Pipeline identique au notebook, resultats coherents."
+                )
 
 
 # ============================================================
